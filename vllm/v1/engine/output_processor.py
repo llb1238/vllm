@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.kv_offload.trace import trace
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -713,6 +714,9 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            if req_state.is_prefilling and engine_core_output.new_token_ids:
+                trace("frontend_first_token", req_id)
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(

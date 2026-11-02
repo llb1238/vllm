@@ -57,6 +57,7 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.trace import ENABLED, trace, trace_span
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
@@ -671,6 +672,7 @@ class OffloadingConnectorScheduler:
             num = min(num, req_status.req.num_prompt_tokens)
         return num
 
+    @trace_span("cpu_hash_scan")
     def _maximal_prefix_lookup(
         self,
         keys: Iterable[OffloadKey],
@@ -681,9 +683,11 @@ class OffloadingConnectorScheduler:
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
+        lookup_count = 0
         hit_count = 0
         defer_lookup = False
         for local_idx, key in enumerate(keys):
+            lookup_count += 1
             result = self.manager.lookup(key, req_context)
             match result:
                 case LookupResult.HIT:
@@ -703,6 +707,9 @@ class OffloadingConnectorScheduler:
                     defer_lookup = True
                 case LookupResult.MISS:
                     break
+        trace(
+            "cpu_hash_scan_result", req.request_id, checked=lookup_count, hits=hit_count
+        )
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -1036,6 +1043,7 @@ class OffloadingConnectorScheduler:
         )
         self._req_status[request.request_id] = req_status
 
+    @trace_span("connector_lookup")
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -1094,6 +1102,13 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
+        trace(
+            "connector_match",
+            request.request_id,
+            matched_tokens=num_hit_tokens,
+            local_tokens=num_computed_tokens,
+            key_count=sum(len(g.offload_keys) for g in req_status.group_states),
+        )
         return num_hit_tokens, bool(num_hit_tokens)
 
     def get_external_cache_hit_sources(
@@ -1143,6 +1158,7 @@ class OffloadingConnectorScheduler:
             position = boundary
         return sources
 
+    @trace_span("connector_alloc")
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
@@ -1739,6 +1755,18 @@ class OffloadingConnectorScheduler:
                 logger.warning("Request %s: cannot store chunks", req_id)
                 continue
 
+            if ENABLED:
+                trace(
+                    "store_plan",
+                    req_id,
+                    keys=store_output.keys_to_store,
+                    evicted_keys=store_output.evicted_keys,
+                    computed_tokens=req.num_computed_tokens,
+                    scheduled_tokens=scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0
+                    ),
+                    status=req.status.name,
+                )
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
@@ -2002,6 +2030,7 @@ class OffloadingConnectorScheduler:
 
         return stats
 
+    @trace_span("connector_finish")
     def request_finished(
         self,
         request: Request,

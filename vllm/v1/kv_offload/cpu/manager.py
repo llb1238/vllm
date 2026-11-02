@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.trace import ENABLED, trace, trace_span
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 
@@ -201,6 +202,7 @@ class CPUOffloadingManager(OffloadingManager):
         return CacheHitSource.HOST
 
     @override
+    @trace_span("cpu_prepare_load")
     def prepare_load(
         self,
         keys: Collection[OffloadKey],
@@ -215,6 +217,8 @@ class CPUOffloadingManager(OffloadingManager):
         *,
         record_access: bool,
     ) -> LoadStoreSpec:
+        if ENABLED:
+            trace("cpu_load_keys", req_context.req_id, keys=list(keys))
         chunks = []
         for key in keys:
             chunk = self._policy.get(key)
@@ -235,6 +239,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.touch(keys, req_context)
 
     @override
+    @trace_span("cpu_load_complete")
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
@@ -248,6 +253,7 @@ class CPUOffloadingManager(OffloadingManager):
                 self._policy.mark_evictable(key)
 
     @override
+    @trace_span("cpu_prepare_store")
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
@@ -322,6 +328,8 @@ class CPUOffloadingManager(OffloadingManager):
             # a chunk that was already stored must remain in the cache after this call.
             protected = set(keys)
             evicted = self._policy.evict(num_chunks_to_evict, protected)
+            if ENABLED and evicted is not None:
+                trace("cpu_evict", req_context.req_id, keys=[key for key, _ in evicted])
             if evicted is None:
                 return None
 
@@ -362,6 +370,7 @@ class CPUOffloadingManager(OffloadingManager):
         )
 
     @override
+    @trace_span("cpu_store_ready")
     def complete_store(
         self,
         keys: Collection[OffloadKey],
@@ -387,6 +396,8 @@ class CPUOffloadingManager(OffloadingManager):
                     self._policy.remove(key)
                     self._free_chunk(chunk)
 
+        if ENABLED and stored_keys:
+            trace("cpu_keys_ready", req_context.req_id, keys=stored_keys)
         if stored_keys and self.events is not None:
             self.events.append(
                 OffloadingEvent(

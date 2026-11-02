@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadingWorker,
 )
+from vllm.v1.kv_offload.trace import bind_job, trace
 
 logger = init_logger(__name__)
 
@@ -251,6 +252,8 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
+            bind_job(job_id, entry.req_id)
+            trace("worker_load_submit", entry.req_id, job_id=job_id)
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
@@ -258,6 +261,8 @@ class OffloadingConnectorWorker:
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
+            bind_job(job_id, entry.req_id)
+            trace("worker_store_defer", entry.req_id, job_id=job_id)
             if not self._is_store_writer:
                 # Gate before queueing: no _unsubmitted_store_jobs entry.
                 self._connector_worker_meta.mark_completed(job_id)
@@ -303,6 +308,7 @@ class OffloadingConnectorWorker:
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
+                trace("worker_recv_done", req_id, job_id=job_id)
                 finished_recving.add(req_id)
 
         return set(), finished_recving

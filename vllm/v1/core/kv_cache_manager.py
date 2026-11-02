@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_offload.trace import trace_span
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -368,6 +369,7 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    @trace_span("allocate")
     def allocate_slots(
         self,
         request: Request,
@@ -617,6 +619,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    @trace_span("request_free")
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -779,6 +782,7 @@ class KVCacheManager:
 
         return cached_tokens or 0
 
+    @trace_span("cache_commit")
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 

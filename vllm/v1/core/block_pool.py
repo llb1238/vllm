@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
     to_event_extra_keys,
 )
+from vllm.v1.kv_offload.trace import ENABLED, trace
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -605,6 +606,13 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+        if removed_hashes and ENABLED:
+            trace(
+                "gpu_hash_remove",
+                block_id=block.block_id,
+                keys=removed_hashes,
+                ref_cnt=block.ref_cnt,
+            )
         block.reset_hash()
         return removed_hashes
 
@@ -644,6 +652,12 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        trace(
+            "gpu_cache_insert",
+            block_id=block.block_id,
+            key=block_hash_with_group_id,
+            ref_cnt=block.ref_cnt,
+        )
 
     def move_block_hashes(
         self,
@@ -790,6 +804,12 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                trace(
+                    "gpu_free_zero_ref",
+                    block_id=block.block_id,
+                    key=block.block_hash,
+                    ref_cnt=block.ref_cnt,
+                )
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)

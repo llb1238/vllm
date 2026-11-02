@@ -32,6 +32,12 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
 )
+from vllm.v1.kv_offload.trace import (
+    ENABLED,
+    forget_job,
+    job_request,
+    trace,
+)
 
 logger = init_logger(__name__)
 
@@ -537,6 +543,12 @@ class SingleDirectionOffloadingHandler:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
+        trace(
+            "copy_prepare",
+            job_request(job_id),
+            job_id=job_id,
+            direction="store" if self.gpu_to_cpu else "load",
+        )
         src_blocks = src_spec.block_ids
         dst_blocks = dst_spec.block_ids
         assert src_blocks.ndim == 1
@@ -675,6 +687,18 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+        if ENABLED:
+            trace(
+                "copy_enqueue",
+                job_request(job_id),
+                job_id=job_id,
+                direction="store" if self.gpu_to_cpu else "load",
+                copy_ops=op_idx,
+                num_bytes=num_transfer_bytes,
+                src_blocks=num_src_blocks,
+                dst_blocks=num_dst_blocks,
+                copy_impl=str(self._swap_blocks_batch),
+            )
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0:
@@ -686,6 +710,12 @@ class SingleDirectionOffloadingHandler:
                 )
             end_event.record(stream)
 
+        trace(
+            "copy_enqueued",
+            job_request(job_id),
+            job_id=job_id,
+            direction="store" if self.gpu_to_cpu else "load",
+        )
         self._transfer_events[job_id] = end_event
         self._transfers.append(
             Transfer(
@@ -717,6 +747,15 @@ class SingleDirectionOffloadingHandler:
                 transfer_time=transfer_time,
             )
 
+            trace(
+                "copy_done",
+                job_request(transfer.job_id),
+                job_id=transfer.job_id,
+                direction="store" if self.gpu_to_cpu else "load",
+                cuda_ms=transfer_time * 1000,
+                num_bytes=transfer.num_bytes,
+            )
+            forget_job(transfer.job_id)
             results.append(result)
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)

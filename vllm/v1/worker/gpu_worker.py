@@ -92,6 +92,7 @@ from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtim
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_offload.trace import ENABLED, flush_trace, trace
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -1302,6 +1303,9 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if ENABLED:
+            for req_id, count in scheduler_output.num_scheduled_tokens.items():
+                trace("worker_execute", req_id, num_tokens=count)
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         if self._pp_send_work:
@@ -1604,6 +1608,7 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        flush_trace()
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

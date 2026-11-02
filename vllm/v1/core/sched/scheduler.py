@@ -60,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.kv_offload.trace import ENABLED, flush_trace, trace, trace_span
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     KV_FETCH_COMPLETED_WAITING,
@@ -555,6 +556,7 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    @trace_span("gpu_lookup")
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -590,6 +592,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        trace("schedule_begin", step=self.current_step)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -925,6 +928,12 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                trace(
+                    "schedule_consider",
+                    request_id,
+                    step=self.current_step,
+                    status=request.status.name,
+                )
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1321,6 +1330,12 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    trace(
+                        "load_wait",
+                        request_id,
+                        step=self.current_step,
+                        external_tokens=num_external_computed_tokens,
+                    )
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -1553,6 +1568,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if ENABLED:
+            trace(
+                "schedule_end",
+                step=self.current_step,
+                tokens=scheduler_output.num_scheduled_tokens,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2103,6 +2124,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+            trace("scheduler_output", req_id, scheduled_tokens=num_tokens_scheduled)
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -2614,6 +2636,7 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        trace("request_arrived", request.request_id)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2711,6 +2734,7 @@ class Scheduler(SchedulerInterface):
 
         return valid_requests
 
+    @trace_span("request_finish")
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -2978,6 +3002,7 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        flush_trace()
         logger.debug_once("[shutdown] Scheduler: start")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
@@ -3180,7 +3205,9 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             if request_id not in self.finished_recving_kv_req_ids:
                 logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request_id)
+                trace("load_blocked", request_id, step=self.current_step)
                 return False
+            trace("load_resume", request_id, step=self.current_step)
             # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
@@ -3220,6 +3247,7 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            trace("scheduler_recv_done", req_id, step=self.current_step)
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
