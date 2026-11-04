@@ -345,6 +345,24 @@ class SchedulerOffloadConfig(NamedTuple):
         )
 
 
+def _iter_offload_keys(
+    block_hashes: Sequence[bytes],
+    group: GroupOffloadConfig,
+    start_chunk: int = 0,
+) -> Iterable[tuple[OffloadKey, int]]:
+    hashes = islice(
+        block_hashes,
+        group.hashes_per_chunk * start_chunk + group.hashes_per_chunk - 1,
+        None,
+        group.hashes_per_chunk,
+    )
+    for index, block_hash in enumerate(hashes, start_chunk + 1):
+        yield (
+            make_offload_key(block_hash, group.group_idx),
+            index * group.tokens_per_chunk,
+        )
+
+
 @dataclass
 class RequestGroupState:
     offload_keys: list[OffloadKey] = field(default_factory=list)
@@ -419,23 +437,15 @@ class RequestOffloadState:
             )
 
     def update_offload_keys(self) -> None:
+        self.req_context.num_prompt_tokens = self.req.num_prompt_tokens
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
-            for req_block_hash in islice(
-                self.req.block_hashes,
-                group_config.hashes_per_chunk * len(group_state.offload_keys)
-                + group_config.hashes_per_chunk
-                - 1,
-                None,
-                group_config.hashes_per_chunk,
+            for key, end_token in _iter_offload_keys(
+                self.req.block_hashes, group_config, len(group_state.offload_keys)
             ):
-                key = make_offload_key(req_block_hash, group_config.group_idx)
                 group_state.offload_keys.append(key)
-                self.req_context.set_offload_key_position(
-                    key,
-                    len(group_state.offload_keys) * group_config.tokens_per_chunk,
-                )
+                self.req_context.set_offload_key_position(key, end_token)
 
     def update_block_id_groups(
         self, new_block_id_groups: tuple[list[int], ...] | None
@@ -546,19 +556,28 @@ def _parse_tier_filter(raw: Any) -> TierFilter:
     return TierFilter(matchers=tuple(matchers))
 
 
-def _create_req_context(req: Request) -> ReqContext:
+def _create_req_context(
+    req: Request, group_configs: Sequence[GroupOffloadConfig] = ()
+) -> ReqContext:
     params = req.kv_transfer_params
     load_filter = TierFilter.ALL
     if params:
         raw = params.get(KV_LOAD_TIERS_KEY)
         if raw is not None:
             load_filter = _parse_tier_filter(raw)
-    return ReqContext(
+    context = ReqContext(
         req_id=req.request_id,
         kv_transfer_params=params,
         kv_hints=req.kv_hints,
         load_tier_filter=load_filter,
+        num_prompt_tokens=req.num_prompt_tokens,
     )
+    # Include GPU-hit prompt keys even if no offloading state was started.
+    # Only metadata is populated: no allocation, lookup, touch, or store.
+    for group in group_configs:
+        for key, end_token in _iter_offload_keys(req.block_hashes, group):
+            context.set_offload_key_position(key, end_token)
+    return context
 
 
 class OffloadingConnectorScheduler:
@@ -1033,7 +1052,7 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
-        req_context = _create_req_context(request)
+        req_context = _create_req_context(request, self.config.kv_group_configs)
         offloading_context = self.manager.on_new_request(req_context)
         req_status = RequestOffloadState(
             config=self.config,
@@ -2050,7 +2069,7 @@ class OffloadingConnectorScheduler:
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
             # nothing was deferred, so finalize immediately.
-            req_context = _create_req_context(request)
+            req_context = _create_req_context(request, self.config.kv_group_configs)
             self.manager.on_new_request(req_context)
             self.manager.on_request_finished(req_context)
             return False, None

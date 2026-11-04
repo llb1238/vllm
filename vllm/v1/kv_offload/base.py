@@ -93,6 +93,8 @@ class ReqContext:
     kv_transfer_params: dict[str, Any] | None = None
     kv_hints: KvHintsEnvelope | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
+    # Prompt boundary for policies; None for legacy/manual contexts.
+    num_prompt_tokens: int | None = None
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params and kv_hints once (in on_new_request) and read the
     # result back on later calls for the same request.
@@ -115,6 +117,21 @@ class ReqContext:
 
     def get_offload_key_position(self, key: OffloadKey) -> int | None:
         return self._offload_key_positions.get(key)
+
+    def get_offload_prefix_keys(self) -> tuple[OffloadKey, ...]:
+        """Registered prompt keys in depth order, excluding generated tokens.
+
+        This is ownership metadata, not a CPU hit or a resident-key list.
+        Partial-boundary keys and multiple groups retain their actual positions.
+        """
+        if self.num_prompt_tokens is None:
+            raise ValueError("Prompt boundary is unavailable in this ReqContext")
+        positions = self._offload_key_positions
+        return tuple(
+            key
+            for key in sorted(positions, key=lambda k: (positions[k], k))
+            if 0 < positions[key] <= self.num_prompt_tokens
+        )
 
 
 class LookupResult(Enum):

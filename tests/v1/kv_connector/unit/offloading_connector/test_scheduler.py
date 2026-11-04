@@ -248,6 +248,170 @@ def test_create_req_context_preserves_kv_hints():
     assert _create_req_context(request).kv_hints is kv_hints
 
 
+@pytest.mark.parametrize("hashes_per_chunk", [1, 2])
+def test_context_creation_and_updates_have_identical_positions(hashes_per_chunk):
+    """GPU hits, incremental updates and decode preserve the same key depths."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        RequestGroupState,
+    )
+
+    group = SimpleNamespace(
+        group_idx=0,
+        hashes_per_chunk=hashes_per_chunk,
+        tokens_per_chunk=16 * hashes_per_chunk,
+    )
+    request = SimpleNamespace(
+        request_id="prefix",
+        num_prompt_tokens=64,
+        kv_transfer_params=None,
+        kv_hints=None,
+        block_hashes=[bytes([i]) * 32 for i in range(4)],
+    )
+    context = _create_req_context(request, [group])
+    state = object.__new__(RequestOffloadState)
+    state.config = SimpleNamespace(kv_group_configs=[group])
+    state.req = request
+    state.req_context = context
+    state.group_states = (RequestGroupState(next_stored_chunk_idx=4),)
+    prompt_keys = context.get_offload_prefix_keys()
+    assert len(prompt_keys) == 4 // hashes_per_chunk
+    for i in range(4, 8):
+        state.update_offload_keys()
+        state.update_offload_keys()
+        request.block_hashes.append(bytes([i]) * 32)
+    state.update_offload_keys()
+    recreated = _create_req_context(request, [group])
+    assert context._offload_key_positions == recreated._offload_key_positions
+    assert context.get_offload_prefix_keys() == prompt_keys
+    assert len(context._offload_key_positions) == 8 // hashes_per_chunk
+    context.num_prompt_tokens = 128
+    assert len(context.get_offload_prefix_keys()) == 8 // hashes_per_chunk
+
+
+@pytest.mark.parametrize("hashes_per_chunk", [1, 2])
+def test_final_positions_match_unpatched_version(hashes_per_chunk):
+    """Compare the actual old function with patched creation and updates."""
+    import ast
+    import subprocess
+    from pathlib import Path
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import scheduler
+
+    try:
+        source = subprocess.check_output(
+            [
+                "git",
+                "show",
+                "60da6135b0349fac50a051e9dcec2bd5b4514400:"
+                "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py",
+            ],
+            cwd=Path(__file__).parent,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip("Pinned unpatched commit is unavailable")
+    tree = ast.parse(source)
+    old_class = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RequestOffloadState"
+    )
+    old_update = next(
+        n
+        for n in old_class.body
+        if isinstance(n, ast.FunctionDef) and n.name == "update_offload_keys"
+    )
+    namespace = dict(vars(scheduler))
+    exec(
+        compile(
+            ast.Module(body=[old_update], type_ignores=[]),
+            "<pinned-unpatched-update>",
+            "exec",
+        ),
+        namespace,
+    )
+    legacy_update = namespace["update_offload_keys"]
+    group = SimpleNamespace(
+        group_idx=0,
+        hashes_per_chunk=hashes_per_chunk,
+        tokens_per_chunk=16 * hashes_per_chunk,
+    )
+    request = SimpleNamespace(
+        request_id="compat",
+        num_prompt_tokens=64,
+        kv_transfer_params=None,
+        kv_hints=None,
+        block_hashes=[bytes([i]) * 32 for i in range(4)],
+    )
+
+    def state(context):
+        result = object.__new__(RequestOffloadState)
+        result.config = SimpleNamespace(kv_group_configs=[group])
+        result.req = request
+        result.req_context = context
+        result.group_states = (scheduler.RequestGroupState(),)
+        return result
+
+    patched = state(_create_req_context(request, [group]))
+    legacy = state(ReqContext(request.request_id))
+    for i in range(4, 10):
+        patched.update_offload_keys()
+        legacy_update(legacy)
+        patched.update_offload_keys()
+        legacy_update(legacy)
+        assert patched.req_context._offload_key_positions == (
+            legacy.req_context._offload_key_positions
+        )
+        request.block_hashes.append(bytes([i]) * 32)
+    patched.update_offload_keys()
+    legacy_update(legacy)
+    assert patched.req_context._offload_key_positions == (
+        legacy.req_context._offload_key_positions
+    )
+    assert len(patched.req_context.get_offload_prefix_keys()) == 4 // hashes_per_chunk
+
+
+def test_untracked_finished_context_includes_gpu_prefix():
+    """Even without an offload state, finalization exposes all prompt keys."""
+    group = SimpleNamespace(group_idx=0, hashes_per_chunk=1, tokens_per_chunk=16)
+    request = SimpleNamespace(
+        request_id="untracked",
+        num_prompt_tokens=32,
+        kv_transfer_params=None,
+        kv_hints=None,
+        block_hashes=[b"a" * 32, b"b" * 32, b"c" * 32],
+    )
+    manager = MagicMock()
+    scheduler = SimpleNamespace(
+        _req_status={},
+        manager=manager,
+        config=SimpleNamespace(kv_group_configs=[group]),
+    )
+    assert OffloadingConnectorScheduler.request_finished(scheduler, request) == (
+        False,
+        None,
+    )
+    context = manager.on_request_finished.call_args.args[0]
+    assert len(context.get_offload_prefix_keys()) == 2
+    assert len(context._offload_key_positions) == 3
+
+
+def test_prefix_context_short_prompt_and_missing_boundary():
+    """No full chunk is valid for a short prompt; legacy contexts fail closed."""
+    group = SimpleNamespace(group_idx=0, hashes_per_chunk=1, tokens_per_chunk=16)
+    request = SimpleNamespace(
+        request_id="short",
+        num_prompt_tokens=10,
+        kv_transfer_params=None,
+        kv_hints=None,
+        block_hashes=[],
+    )
+    assert _create_req_context(request, [group]).get_offload_prefix_keys() == ()
+    with pytest.raises(ValueError, match="Prompt boundary"):
+        ReqContext("legacy").get_offload_prefix_keys()
+
+
 def _reduce_kv_connector_stats(runner):
     reduced: dict[str, int | float] = {}
     for payload in runner.kv_connector_stats:
